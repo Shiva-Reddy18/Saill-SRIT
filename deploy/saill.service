@@ -1,0 +1,18 @@
+[Unit]
+Description=SAILL Communicative English Lab Engine
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/saill
+EnvironmentFile=/var/www/saill/.env
+ExecStart=/usr/bin/node /var/www/saill/dist/server.cjs
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=saill
+
+[Install]
+WantedBy=multi-user.target
