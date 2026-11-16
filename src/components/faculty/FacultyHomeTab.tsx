@@ -19,6 +19,13 @@ import {
   Award
 } from 'lucide-react';
 
+const normalizeSection = (value?: string): string =>
+  (value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/^SECTION\s*/i, '')
+    .trim();
+
 interface FacultyHomeTabProps {
   assignments: FacultyAssignment[];
   assignedStudents: StudentProfile[];
@@ -66,12 +73,12 @@ export const FacultyHomeTab: React.FC<FacultyHomeTabProps> = ({
         return (
           (!aBranch || sBranch.includes(aBranch) || aBranch.includes(sBranch)) &&
           (!aSem || sSem.includes(aSem) || aSem.includes(sSem)) &&
-          (!aSec || sSec === aSec)
+          (!aSec || normalizeSection(sSec) === normalizeSection(aSec))
         );
       })
     : assignedStudents;
 
-  const totalClassStudents = classStudents.length || (totalClasses > 0 ? totalStudents : 0);
+  const totalClassStudents = classStudents.length;
 
   // Module release state for current active class
   const classKey = activeAssignment ? ModuleReleaseService.getClassKey(activeAssignment) : 'default';
@@ -287,7 +294,7 @@ export const FacultyHomeTab: React.FC<FacultyHomeTabProps> = ({
                     return (
                       (!aBranch || sBranch.includes(aBranch) || aBranch.includes(sBranch)) &&
                       (!aSem || sSem.includes(aSem) || aSem.includes(sSem)) &&
-                      (!aSec || sSec === aSec)
+                      (!aSec || normalizeSection(sSec) === normalizeSection(aSec))
                     );
                   });
 
@@ -300,7 +307,7 @@ export const FacultyHomeTab: React.FC<FacultyHomeTabProps> = ({
                     >
                       <div className="space-y-1">
                         <span className="px-2 py-0.5 bg-blue-50 text-blue-700 text-[10px] font-bold rounded-md">
-                          {assignment.semester} • Section {assignment.section}
+                          {assignment.semester} • {assignment.section}
                         </span>
                         <h3 className="font-extrabold text-sm text-[#2C3E50] font-serif">
                           {assignment.branch}
