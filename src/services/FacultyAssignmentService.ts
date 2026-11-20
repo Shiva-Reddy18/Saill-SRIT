@@ -7,57 +7,53 @@ export class FacultyAssignmentService {
   private static isInitialized: boolean = false;
   private static initialization: Promise<FacultyAssignment[]> | null = null;
 
+  static async initFromDB(forceRefresh: boolean = false): Promise<FacultyAssignment[]> {
+    console.info('[FacultyAssignmentService] initFromDB', {
+      alreadyInitialized: this.isInitialized,
+      reloadInProgress: Boolean(this.initialization),
+      forceRefresh
+    });
 
-static async initFromDB(): Promise<FacultyAssignment[]> {
-  console.info('[FacultyAssignmentService] initFromDB', {
-    alreadyInitialized: this.isInitialized,
-    reloadInProgress: Boolean(this.initialization)
-  });
+    // Reuse an existing request if one is running.
+    if (this.initialization) {
+      return this.initialization;
+    }
 
-  // Reuse an existing request if one is running.
-  if (this.initialization) {
+    // Use cached assignments unless a fresh Supabase read is requested.
+    if (this.isInitialized && !forceRefresh) {
+      console.info(
+        '[FacultyAssignmentService] Using cached assignments',
+        { assignmentCount: this.assignmentsCache.length }
+      );
+      return this.assignmentsCache;
+    }
+
+    this.initialization = (async () => {
+      try {
+        const dbAssignments = await dbStorage.getAllFacultyAssignments();
+
+        this.assignmentsCache = dbAssignments;
+        this.isInitialized = true;
+
+        console.info(
+          '[FacultyAssignmentService] Assignments loaded',
+          { assignmentCount: dbAssignments.length }
+        );
+
+        return dbAssignments;
+      } catch (error) {
+        console.error(
+          '[FacultyAssignmentService] Assignment loading failed:',
+          error
+        );
+        throw error;
+      }
+    })().finally(() => {
+      this.initialization = null;
+    });
+
     return this.initialization;
   }
-
-  // Don't unnecessarily fetch assignments again.
-  if (this.isInitialized) {
-    console.info(
-      '[FacultyAssignmentService] Using cached assignments',
-      { assignmentCount: this.assignmentsCache.length }
-    );
-
-    return this.assignmentsCache;
-  }
-
-  this.initialization = (async () => {
-    try {
-      const dbAssignments =
-        await dbStorage.getAllFacultyAssignments();
-
-      this.assignmentsCache = dbAssignments;
-      this.isInitialized = true;
-
-      console.info(
-        '[FacultyAssignmentService] Assignments loaded',
-        { assignmentCount: dbAssignments.length }
-      );
-
-      return dbAssignments;
-    } catch (error) {
-      console.error(
-        '[FacultyAssignmentService] Assignment loading failed:',
-        error
-      );
-
-      throw error;
-    }
-  })().finally(() => {
-    this.initialization = null;
-  });
-
-  return this.initialization;
-}
-
 
   static getAllAssignments(): FacultyAssignment[] {
     if (!this.isInitialized) {
@@ -118,7 +114,6 @@ static async initFromDB(): Promise<FacultyAssignment[]> {
       );
 
       if (!exists) {
-        // Find matching batch
         const matchingBatch = allBatches.find(
           (b) =>
             b.branch?.toUpperCase() === item.branch.toUpperCase() &&
@@ -140,7 +135,6 @@ static async initFromDB(): Promise<FacultyAssignment[]> {
           'AutoSync Engine'
         );
 
-        // Update batch if found
         if (matchingBatch) {
           try {
             await dbStorage.updateBatch(matchingBatch.id, {
@@ -173,162 +167,112 @@ static async initFromDB(): Promise<FacultyAssignment[]> {
     return Array.from(sections);
   }
 
-  
+  static getAssignedStudentsForFaculty(
+    facultyId: string,
+    allStudents: StudentProfile[]
+  ): StudentProfile[] {
+    if (!facultyId) return [];
 
+    const normalize = (value: unknown): string =>
+      String(value || '')
+        .trim()
+        .toUpperCase()
+        .replace(/^SECTION\s*/, '')
+        .replace(/[–—]/g, '-')
+        .replace(/\s+/g, '');
 
-
-static getAssignedStudentsForFaculty(
-  facultyId: string,
-  allStudents: StudentProfile[]
-): StudentProfile[] {
-  if (!facultyId) return [];
-
-  const normalize = (value: unknown): string =>
-    String(value || '')
-      .trim()
-      .toUpperCase()
-      .replace(/^SECTION\s*/, '')
-      .replace(/[–—]/g, '-')
-      .replace(/\s+/g, '');
-
-  const normalizeSemester = (value: unknown): string => {
-    const v = normalize(value)
-      .replace(/^SEMESTER/, '')
-      .replace(/^SEM/, '');
-
-    const roman: Record<string, string> = {
-      I: '1',
-      II: '2',
-      III: '3',
-      IV: '4',
-      V: '5',
-      VI: '6',
-      VII: '7',
-      VIII: '8'
+    const normalizeBranch = (value: unknown): string => {
+      const branch = normalize(value);
+      if (
+        branch === 'CSE' ||
+        branch === 'COMPUTERSCIENCEENGINEERING' ||
+        branch === 'COMPUTERSCIENCEANDENGINEERING'
+      ) {
+        return 'CSE';
+      }
+      return branch;
     };
 
-    return roman[v] || v;
-  };
+    const normalizeSemester = (value: unknown): string => {
+      const v = normalize(value)
+        .replace(/^SEMESTER/, '')
+        .replace(/^SEM/, '');
 
-  const normalizeYear = (value: unknown): string => {
-    const v = normalize(value).replace(/\//g, '-');
-    const match = v.match(/^(\d{4})-(\d{2}|\d{4})$/);
+      const roman: Record<string, string> = {
+        I: '1',
+        II: '2',
+        III: '3',
+        IV: '4',
+        V: '5',
+        VI: '6',
+        VII: '7',
+        VIII: '8'
+      };
 
-    return match
-      ? `${match[1]}-${match[2].slice(-2)}`
-      : v;
-  };
+      return roman[v] || v;
+    };
 
-  const normFacultyId = normalize(facultyId);
+    const normalizeYear = (value: unknown): string => {
+      const v = normalize(value).replace(/\//g, '-');
+      const match = v.match(/^(\d{4})-(\d{2}|\d{4})$/);
+      return match ? `${match[1]}-${match[2].slice(-2)}` : v;
+    };
 
-  const activeAssignments =
-    this.getAssignmentsForFaculty(facultyId)
-      .filter(a => a.status === 'ACTIVE');
-
-  if (!activeAssignments.length) return [];
-
-  return (allStudents || []).filter(student => {
-    if (!student) return false;
-
-    const studentFaculty = normalize(
-      student.assignedFacultyId ||
-      (student as any).assigned_faculty_id
+    const normFacultyId = normalize(facultyId);
+    const activeAssignments = this.getAssignmentsForFaculty(facultyId).filter(
+      (a) => a.status === 'ACTIVE'
     );
 
-    const studentBranch = normalize(
-      student.branch || student.department
-    );
+    return (allStudents || []).filter((student) => {
+      if (!student) return false;
 
-    const studentSection = normalize(student.section);
+      const studentFaculty = normalize(
+        student.assignedFacultyId || (student as any).assigned_faculty_id
+      );
 
-    const studentYear = normalizeYear(
-      student.academicYear ||
-      (student as any).academic_year
-    );
-    console.log('[STUDENT RAW DATA]', {
-  rollNo: student.rollNo,
-  academicYear: student.academicYear,
-  academic_year: (student as any).academic_year,
-  batch: student.batch,
-  batchId: student.batchId,
-  semester: student.semester,
-  branch: student.branch,
-  section: student.section
-});
+      // Strict ownership: if the student is explicitly assigned to a faculty,
+      // ONLY that faculty member may see them.
+      if (studentFaculty !== '') {
+        return studentFaculty === normFacultyId;
+      }
 
-    const studentSemester = normalizeSemester(
-      student.semester
-    );
+      // Otherwise, match via the faculty member's active class/section assignments.
+      if (!activeAssignments.length) return false;
 
-    
-const matchingAssignments = activeAssignments.filter(assignment => {
-  if (normalize(assignment.facultyId) !== normFacultyId) {
-    return false;
-  }
+      const studentSection = normalize(student.section);
+      const studentYear = normalizeYear(
+        student.academicYear || (student as any).academic_year
+      );
+      const studentSemester = normalizeSemester(student.semester);
 
-  const normalizeBranch = (value: unknown): string => {
-  const branch = normalize(value);
+      const matchingAssignments = activeAssignments.filter((assignment) => {
+        if (normalize(assignment.facultyId) !== normFacultyId) {
+          return false;
+        }
 
-  if (
-    branch === 'CSE' ||
-    branch === 'COMPUTERSCIENCEENGINEERING'
-  ) {
-    return 'CSE';
-  }
+        const branchMatch =
+          normalizeBranch(assignment.branch) ===
+          normalizeBranch(student.branch || student.department);
 
-  return branch;
-};
+        const sections = [
+          assignment.section,
+          ...(assignment.sections || [])
+        ].map(normalize);
 
-const branchMatch =
-  normalizeBranch(assignment.branch) ===
-  normalizeBranch(student.branch || student.department);
+        const sectionMatch = sections.includes(studentSection);
+        const semesterMatch =
+          normalizeSemester(assignment.semester) === studentSemester;
 
-  const sections = [
-    assignment.section,
-    ...(assignment.sections || [])
-  ].map(normalize);
+        return branchMatch && sectionMatch && semesterMatch;
+      });
 
-  const sectionMatch = sections.includes(studentSection);
-
-  const semesterMatch =
-    normalizeSemester(assignment.semester) === studentSemester;
-
-  return branchMatch && sectionMatch && semesterMatch;
-});
-
-// If academic year exists, require an exact match.
-// If missing, accept only when there is exactly one
-// matching active allocation for this academic scope.
-const matched = studentYear
-  ? matchingAssignments.some(
-      assignment =>
-        normalizeYear(assignment.academicYear) === studentYear
-    )
-  : matchingAssignments.length === 1;
-
-const assignedToAnotherFaculty =
-  studentFaculty !== '' &&
-  studentFaculty !== normFacultyId;
-
-const finalMatch = matched && !assignedToAnotherFaculty;
-
-
-    console.log('[FACULTY MATCH DEBUG]', {
-      facultyId,
-      studentRollNo: student.rollNo,
-      assignedFacultyId: studentFaculty,
-      studentBranch,
-      studentSection,
-      studentYear,
-      studentSemester,
-      matched
+      return studentYear
+        ? matchingAssignments.some(
+            (assignment) => normalizeYear(assignment.academicYear) === studentYear
+          )
+        : matchingAssignments.length === 1;
     });
-
-    return finalMatch;
-  });
-}
-
-
+  }
 
   static async createAssignment(
     payload: FacultyAssignmentPayload,
@@ -337,7 +281,6 @@ const finalMatch = matched && !assignedToAnotherFaculty;
     const list = this.getAllAssignments();
     const normFacultyId = payload.facultyId.trim().toUpperCase();
 
-    // Prevent duplicate active assignment for the same faculty, branch, year, sem, section
     const isDuplicate = list.some(
       (a) =>
         a.status === 'ACTIVE' &&
@@ -354,7 +297,6 @@ const finalMatch = matched && !assignedToAnotherFaculty;
       );
     }
 
-    // Check if another faculty is already assigned to this exact section
     const conflict = list.find(
       (a) =>
         a.status === 'ACTIVE' &&
@@ -402,14 +344,12 @@ const finalMatch = matched && !assignedToAnotherFaculty;
     list.unshift(newRecord);
     this.assignmentsCache = list;
 
-    // Persist permanently to Supabase via dbStorage
     try {
       await dbStorage.saveFacultyAssignment(newRecord);
     } catch (e) {
       console.warn('Failed to save faculty assignment to Supabase:', e);
     }
 
-    // Log Audit Trail
     try {
       await dbStorage.logAuditTrail(
         'FACULTY_ALLOCATION_UPDATE',
@@ -422,7 +362,6 @@ const finalMatch = matched && !assignedToAnotherFaculty;
       // Audit log fallback
     }
 
-    // Trigger auto-mapping for unmapped students
     try {
       await dbStorage.autoMapUnmappedStudents();
     } catch {

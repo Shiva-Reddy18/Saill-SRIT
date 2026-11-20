@@ -546,9 +546,6 @@ export class IndexedDBStorage {
     }
   ): Promise<ModuleReleaseRecord> {
     const releasedAt = new Date().toISOString();
-    // Use the assignment ID in the storage key so older class-wide release
-    // rows cannot collide with this faculty assignment's scoped release.
-    // Keep batchId as the canonical class key for the student-side lookup.
     const itemId = scope?.assignmentId
       ? `${scope.assignmentId}__${moduleId}`
       : `${batchId}__${moduleId}`;
@@ -562,9 +559,6 @@ export class IndexedDBStorage {
       ...(scope || {})
     } as ModuleReleaseRecord;
 
-    // Module releases are authorization-sensitive. Do not use the generic
-    // cache-first helper here: it hides PostgREST errors and performs a
-    // second read. The UI must only report success after this upsert succeeds.
     const { error } = await supabase
       .from('app_data')
       .upsert({
@@ -574,17 +568,11 @@ export class IndexedDBStorage {
         updated_at: releasedAt
       })
       .abortSignal(AbortSignal.timeout(APP_DATA_QUERY_TIMEOUT_MS));
-      // console.log('[RELEASE 3] Supabase response', { error });
-
-if (error) {
-  throw new Error(`Failed to save module release for ${batchId}: ${error.message}`);
-}
 
     if (error) {
       throw new Error(`Failed to save module release for ${batchId}: ${error.message}`);
     }
 
-    // Keep the local cache in sync without making another network request.
     try {
       if (typeof localStorage !== 'undefined') {
         const cacheKey = 'saill_cache_moduleReleases';
@@ -659,7 +647,6 @@ if (error) {
     } catch (cacheError) {
       console.warn('[db] Module release revoked, but local cache update failed:', cacheError);
     }
-
   }
 
   async getAllAdminModuleReleases(): Promise<ModuleReleaseRecord[]> {
@@ -874,153 +861,212 @@ if (error) {
   }
 
   // --- Student Profiles ---
+  async getProfile(): Promise<StudentProfile | null> {
+    const rollNo = this.getActiveRoll();
+    if (!rollNo) return null;
+    return await this.getProfileByRollNo(rollNo);
+  }
 
-async getAllProfiles(): Promise<StudentProfile[]> {
-  // Load student records from both storage locations.
-  const { data, error } = await supabase
-    .from('students')
-    .select('*')
-    .abortSignal(AbortSignal.timeout(APP_DATA_QUERY_TIMEOUT_MS));
-
-  if (error) {
-    throw new Error(
-      `Failed to load students from Supabase: ${error.message}`
+  async getProfileByRollNo(rollNoOrEmail: string): Promise<StudentProfile | null> {
+    const clean = String(rollNoOrEmail || '').trim();
+    if (!clean) return null;
+    const upper = clean.toUpperCase();
+    const lower = clean.toLowerCase();
+    const all = await this.getAllProfiles();
+    return (
+      all.find(
+        (s) =>
+          (s.rollNo && s.rollNo.trim().toUpperCase() === upper) ||
+          (s.id && String(s.id).trim().toUpperCase() === upper) ||
+          (s.email && s.email.trim().toLowerCase() === lower)
+      ) || null
     );
   }
 
-  let appProfiles: StudentProfile[] = [];
+  async saveProfile(profile: StudentProfile): Promise<StudentProfile> {
+    const cleanRoll = String(profile.rollNo || profile.id || '').trim().toUpperCase();
+    if (!cleanRoll) {
+      throw new Error('Cannot save student profile without a roll number.');
+    }
 
-  try {
-    appProfiles =
-      await getSupabaseAppDataFromDatabase<StudentProfile>(
-        'studentProfiles'
+    const updatedProfile: StudentProfile = {
+      ...profile,
+      id: cleanRoll,
+      rollNo: cleanRoll
+    };
+
+    await saveSupabaseAppData('studentProfiles', cleanRoll, updatedProfile);
+
+    try {
+      const updatePayload: Record<string, any> = {
+        name: updatedProfile.name,
+        full_name: updatedProfile.name,
+        branch: updatedProfile.branch || updatedProfile.department,
+        department: updatedProfile.department || updatedProfile.branch,
+        section: updatedProfile.section,
+        batch_id: updatedProfile.batchId || updatedProfile.batch || null,
+        assigned_faculty_id: updatedProfile.assignedFacultyId || null,
+        updated_at: new Date().toISOString()
+      };
+      if (updatedProfile.academicYear) {
+        updatePayload.academic_year = updatedProfile.academicYear;
+      }
+      await supabase
+        .from('students')
+        .update(updatePayload)
+        .ilike('roll_no', cleanRoll);
+    } catch (err) {
+      console.warn('[db] saveProfile public.students update warning:', err);
+    }
+
+    return updatedProfile;
+  }
+
+  async getAllProfiles(): Promise<StudentProfile[]> {
+    // Load student records from both storage locations.
+    const { data, error } = await supabase
+      .from('students')
+      .select('*')
+      .abortSignal(AbortSignal.timeout(APP_DATA_QUERY_TIMEOUT_MS));
+
+    if (error) {
+      throw new Error(
+        `Failed to load students from Supabase: ${error.message}`
       );
-  } catch (err) {
-    console.error(
-      '[db] Failed to load studentProfiles from app_data:',
-      err
-    );
-  }
-
-  
-const normalizeProfile = (s: any): StudentProfile => {
-  const fullName =
-    s.full_name ||
-    s.name ||
-    s.fullName ||
-    s.roll_no ||
-    s.rollNo ||
-    s.id;
-
-  return {
-    ...s,
-    id: s.id || s.roll_no || s.rollNo,
-    rollNo: s.roll_no || s.rollNo || s.id,
-
-    // Preserve the original database name
-    name: fullName,
-    full_name: fullName,
-
-    assignedFacultyId:
-      s.assigned_faculty_id ||
-      s.assignedFacultyId ||
-      s.assignedFacultyID ||
-      '',
-
-    branch: s.branch || s.department || '',
-    department: s.department || s.branch || '',
-    programme: s.programme || 'B.Tech',
-
-    academicYear:
-      s.academic_year || s.academicYear || '',
-
-    semester: s.semester || '',
-    section: s.section || '',
-
-    batch: s.batch_id || s.batch || '',
-    batchId: s.batch_id || s.batchId || '',
-
-    mappingStatus:
-      String(s.mapping_status || s.mappingStatus || '')
-        .toUpperCase() === 'MAPPED'
-        ? 'MAPPED'
-        : 'UNMAPPED',
-
-    status: ({
-      pending: 'PENDING_APPROVAL',
-      approved: 'ACTIVE',
-      active: 'ACTIVE',
-      rejected: 'REJECTED',
-      disabled: 'REJECTED',
-      inactive: 'REJECTED'
-    } as const)[normalizeRegistrationStatus(s.status)]
-  } as StudentProfile;
-};
-
-  // Merge by roll number, avoiding duplicate students.
-  const profilesByRollNo = new Map<string, StudentProfile>();
-
-  for (const profile of appProfiles) {
-    const normalized = normalizeProfile(profile);
-    const roll = String(normalized.rollNo || '')
-      .trim()
-      .toUpperCase();
-
-    if (roll) {
-      profilesByRollNo.set(roll, normalized);
     }
-  }
 
-  // Public students table takes precedence for fields it contains.
-  // Preserve app_data values when the public row has empty fields.
-  for (const row of data || []) {
-    const normalized = normalizeProfile(row);
-    const roll = String(normalized.rollNo || '')
-      .trim()
-      .toUpperCase();
+    let appProfiles: StudentProfile[] = [];
 
-    if (!roll) continue;
+    try {
+      appProfiles =
+        await getSupabaseAppDataFromDatabase<StudentProfile>(
+          'studentProfiles'
+        );
+    } catch (err) {
+      console.error(
+        '[db] Failed to load studentProfiles from app_data:',
+        err
+      );
+    }
 
-    const existing = profilesByRollNo.get(roll);
+    const normalizeProfile = (s: any): StudentProfile => {
+      const fullName =
+        s.full_name ||
+        s.name ||
+        s.fullName ||
+        s.roll_no ||
+        s.rollNo ||
+        s.id;
 
-    if (existing) {
-      profilesByRollNo.set(roll, {
-        ...existing,
-        ...normalized,
+      return {
+        ...s,
+        id: s.id || s.roll_no || s.rollNo,
+        rollNo: s.roll_no || s.rollNo || s.id,
+
+        // Preserve the original database name
+        name: fullName,
+        full_name: fullName,
+
         assignedFacultyId:
-          normalized.assignedFacultyId ||
-          existing.assignedFacultyId,
+          s.assigned_faculty_id ||
+          s.assignedFacultyId ||
+          s.assignedFacultyID ||
+          '',
+
+        branch: s.branch || s.department || '',
+        department: s.department || s.branch || '',
+        programme: s.programme || 'B.Tech',
+
         academicYear:
-          normalized.academicYear ||
-          existing.academicYear,
-        branch:
-          normalized.branch || existing.branch,
-        department:
-          normalized.department || existing.department,
-        semester:
-          normalized.semester || existing.semester,
-        section:
-          normalized.section || existing.section,
-        batch:
-          normalized.batch || existing.batch,
-        name:
-          normalized.name || existing.name
-      });
-    } else {
-      profilesByRollNo.set(roll, normalized);
+          s.academic_year || s.academicYear || '',
+
+        semester: s.semester || '',
+        section: s.section || '',
+
+        batch: s.batch_id || s.batch || '',
+        batchId: s.batch_id || s.batchId || '',
+
+        mappingStatus:
+          String(s.mapping_status || s.mappingStatus || '')
+            .toUpperCase() === 'MAPPED'
+            ? 'MAPPED'
+            : 'UNMAPPED',
+
+        status: ({
+          pending: 'PENDING_APPROVAL',
+          approved: 'ACTIVE',
+          active: 'ACTIVE',
+          rejected: 'REJECTED',
+          disabled: 'REJECTED',
+          inactive: 'REJECTED'
+        } as const)[normalizeRegistrationStatus(s.status)]
+      } as StudentProfile;
+    };
+
+    // Merge by roll number, avoiding duplicate students.
+    const profilesByRollNo = new Map<string, StudentProfile>();
+
+    for (const profile of appProfiles) {
+      const normalized = normalizeProfile(profile);
+      const roll = String(normalized.rollNo || '')
+        .trim()
+        .toUpperCase();
+
+      if (roll) {
+        profilesByRollNo.set(roll, normalized);
+      }
     }
+
+    // Public students table takes precedence for fields it contains.
+    // Preserve app_data values when the public row has empty fields.
+    for (const row of data || []) {
+      const normalized = normalizeProfile(row);
+      const roll = String(normalized.rollNo || '')
+        .trim()
+        .toUpperCase();
+
+      if (!roll) continue;
+
+      const existing = profilesByRollNo.get(roll);
+
+      if (existing) {
+        profilesByRollNo.set(roll, {
+          ...existing,
+          ...normalized,
+          assignedFacultyId:
+            normalized.assignedFacultyId ||
+            existing.assignedFacultyId,
+          academicYear:
+            normalized.academicYear ||
+            existing.academicYear,
+          branch:
+            normalized.branch || existing.branch,
+          department:
+            normalized.department || existing.department,
+          semester:
+            normalized.semester || existing.semester,
+          section:
+            normalized.section || existing.section,
+          batch:
+            normalized.batch || existing.batch,
+          name:
+            normalized.name || existing.name
+        });
+      } else {
+        profilesByRollNo.set(roll, normalized);
+      }
+    }
+
+    const result = Array.from(profilesByRollNo.values());
+
+    console.info('[db] Combined student profiles loaded:', {
+      publicStudents: data?.length || 0,
+      appDataStudents: appProfiles.length,
+      uniqueStudents: result.length
+    });
+
+    return result;
   }
-
-  const result = Array.from(profilesByRollNo.values());
-
-  console.info('[db] Combined student profiles loaded:', {
-    publicStudents: data?.length || 0,
-    appDataStudents: appProfiles.length,
-    uniqueStudents: result.length
-  });
-
-  return result;
-}
 
   async deleteStudentProfile(rollNo: string, adminName: string = 'Administrator'): Promise<void> {
     const clean = rollNo.trim().toUpperCase();
@@ -1320,322 +1366,318 @@ const normalizeProfile = (s: any): StudentProfile => {
     return all.filter((b) => b.assignedFacultyInchargeId?.toUpperCase() === clean);
   }
 
- 
-async findBatchForStudent(
-  arg1: string,
-  arg2: string,
-  arg3?: string,
-  arg4?: string,
-  arg5?: string,
-  arg6?: string
-): Promise<AcademicBatch | null> {
-  const all = await this.getAllBatches();
+  async findBatchForStudent(
+    arg1: string,
+    arg2: string,
+    arg3?: string,
+    arg4?: string,
+    arg5?: string,
+    arg6?: string
+  ): Promise<AcademicBatch | null> {
+    const all = await this.getAllBatches();
 
-  const hasProgrammeArgument = arg5 !== undefined;
-  const programme = hasProgrammeArgument ? String(arg1 || '').trim() : '';
+    const hasProgrammeArgument = arg5 !== undefined;
+    const programme = hasProgrammeArgument ? String(arg1 || '').trim() : '';
 
-  let branch = '';
-  let studyYear = '';
-  let semester = '';
-  let section = '';
-  let year = '';
+    let branch = '';
+    let studyYear = '';
+    let semester = '';
+    let section = '';
+    let year = '';
 
-  if (hasProgrammeArgument) {
-    branch = String(arg2 || '').trim();
-    studyYear = String(arg3 || '').trim();
-    semester = String(arg4 || '').trim();
-    section = String(arg5 || '').trim();
-    year = String(arg6 || '').trim();
-  } else {
-    branch = String(arg1 || '').trim();
-    semester = String(arg2 || '').trim();
-    section = String(arg3 || '').trim();
-    year = String(arg4 || '').trim();
-  }
-
-  const normalizeBranch = (value: string): string => {
-    const clean = normalizeBranchString(value).toUpperCase();
-
-    if (
-      clean === 'CSE' ||
-      clean === 'COMPUTERSCIENCEENGINEERING'
-    ) {
-      return 'CSE';
+    if (hasProgrammeArgument) {
+      branch = String(arg2 || '').trim();
+      studyYear = String(arg3 || '').trim();
+      semester = String(arg4 || '').trim();
+      section = String(arg5 || '').trim();
+      year = String(arg6 || '').trim();
+    } else {
+      branch = String(arg1 || '').trim();
+      semester = String(arg2 || '').trim();
+      section = String(arg3 || '').trim();
+      year = String(arg4 || '').trim();
     }
 
-    return clean;
-  };
+    const normalizeBranch = (value: string): string => {
+      const clean = normalizeBranchString(value).toUpperCase();
 
-  const normalizeYear = (value: string): string => {
-    const clean = normalizeAcademicYearString(value)
-      .replace(/[\u2010-\u2015\u2212/]/g, '-')
-      .trim();
+      if (
+        clean === 'CSE' ||
+        clean === 'COMPUTERSCIENCEENGINEERING'
+      ) {
+        return 'CSE';
+      }
 
-    const range = clean.match(/^(\d{4})\s*-\s*(\d{2}|\d{4})$/);
-
-    if (range) {
-      return `${range[1]}-${range[2].slice(-2)}`;
-    }
-
-    return clean.toUpperCase().replace(/\s+/g, '');
-  };
-
-  const normalizeStudyYear = (value: string): string => {
-    const clean = String(value || '')
-      .trim()
-      .toUpperCase()
-      .replace(/[().]/g, ' ')
-      .replace(/\s+/g, ' ');
-
-    const aliases: Record<string, string> = {
-      FIRST: '1',
-      '1ST': '1',
-      I: '1',
-      '1': '1',
-      SECOND: '2',
-      '2ND': '2',
-      II: '2',
-      '2': '2',
-      THIRD: '3',
-      '3RD': '3',
-      III: '3',
-      '3': '3',
-      FOURTH: '4',
-      '4TH': '4',
-      IV: '4',
-      '4': '4'
+      return clean;
     };
 
-    const match =
-      clean.match(
-        /^(FIRST|SECOND|THIRD|FOURTH|1ST|2ND|3RD|4TH|III|II|IV|I|1|2|3|4)(?=\s|$)/
-      ) ||
-      clean.match(
-        /\b(FIRST|SECOND|THIRD|FOURTH|1ST|2ND|3RD|4TH)\s+YEAR\b/
-      ) ||
-      clean.match(
-        /\bYEAR\s+(III|II|IV|I|1|2|3|4)\b/
+    const normalizeYear = (value: string): string => {
+      const clean = normalizeAcademicYearString(value)
+        .replace(/[\u2010-\u2015\u2212/]/g, '-')
+        .trim();
+
+      const range = clean.match(/^(\d{4})\s*-\s*(\d{2}|\d{4})$/);
+
+      if (range) {
+        return `${range[1]}-${range[2].slice(-2)}`;
+      }
+
+      return clean.toUpperCase().replace(/\s+/g, '');
+    };
+
+    const normalizeStudyYear = (value: string): string => {
+      const clean = String(value || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[().]/g, ' ')
+        .replace(/\s+/g, ' ');
+
+      const aliases: Record<string, string> = {
+        FIRST: '1',
+        '1ST': '1',
+        I: '1',
+        '1': '1',
+        SECOND: '2',
+        '2ND': '2',
+        II: '2',
+        '2': '2',
+        THIRD: '3',
+        '3RD': '3',
+        III: '3',
+        '3': '3',
+        FOURTH: '4',
+        '4TH': '4',
+        IV: '4',
+        '4': '4'
+      };
+
+      const match =
+        clean.match(
+          /^(FIRST|SECOND|THIRD|FOURTH|1ST|2ND|3RD|4TH|III|II|IV|I|1|2|3|4)(?=\s|$)/
+        ) ||
+        clean.match(
+          /\b(FIRST|SECOND|THIRD|FOURTH|1ST|2ND|3RD|4TH)\s+YEAR\b/
+        ) ||
+        clean.match(
+          /\bYEAR\s+(III|II|IV|I|1|2|3|4)\b/
+        );
+
+      return match ? aliases[match[1]] || '' : '';
+    };
+
+    const normalizeSemester = (value: string): string => {
+      if (!value.trim()) return '';
+
+      const normalized = normalizeSemesterString(value);
+
+      const clean = normalized
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '')
+        .replace(/^SEMESTER/, '')
+        .replace(/^SEM/, '');
+
+      const romanToNumber: Record<string, string> = {
+        I: '1',
+        II: '2',
+        III: '3',
+        IV: '4',
+        V: '5',
+        VI: '6',
+        VII: '7',
+        VIII: '8'
+      };
+
+      return romanToNumber[clean] || clean;
+    };
+
+    const normalizeSection = (
+      value: string,
+      branchName: string
+    ): string => {
+      const clean = value.trim().toUpperCase()
+        .replace(/^(SECTION|SEC)\s*/, '');
+
+      const separatorIndex = clean.lastIndexOf('-');
+
+      if (separatorIndex > 0) {
+        const prefix = clean.slice(0, separatorIndex);
+
+        if (normalizeBranch(prefix) === normalizeBranch(branchName)) {
+          return clean
+            .slice(separatorIndex + 1)
+            .replace(/[^A-Z0-9]/g, '');
+        }
+      }
+
+      return normalizeSectionString(clean)
+        .replace(/[^A-Z0-9]/g, '')
+        .replace(/^(SECTION|SEC)/, '');
+    };
+
+    const normalizeProgramme = (value: string): string => {
+      const clean = normalizeProgrammeString(value).toUpperCase();
+
+      if (
+        clean === 'BACHELOROFTECHNOLOGY' ||
+        clean === 'BACHELORTECHNOLOGY' ||
+        clean === 'BTECH'
+      ) {
+        return 'BTECH';
+      }
+
+      return clean;
+    };
+
+    const requestedYear = normalizeYear(year);
+    const requestedStudyYear = normalizeStudyYear(studyYear);
+    const requestedBranch = normalizeBranch(branch);
+    const requestedSemester = normalizeSemester(semester);
+    const requestedSection = normalizeSection(section, branch);
+    const requestedProgramme = normalizeProgramme(programme);
+
+    const matchingClassBatches = all.filter((batch) => {
+      if (String(batch.status || '').toLowerCase() !== 'active') {
+        return false;
+      }
+
+      const branchValues = [
+        batch.branch || '',
+        batch.department || '',
+        String((batch as any).branchCode || ''),
+        String(batch.batchCode || (batch as any).batch_code || '').split('-')[0]
+      ].filter(Boolean);
+
+      const branchMatches = branchValues.some(
+        (value) => normalizeBranch(value) === requestedBranch
       );
 
-    return match ? aliases[match[1]] || '' : '';
-  };
+      const yearMatches =
+        !requestedYear ||
+        normalizeYear(String(batch.academicYear || '')) === requestedYear;
 
-  const normalizeSemester = (value: string): string => {
-    if (!value.trim()) return '';
+      const batchStudyYear = normalizeStudyYear(String(batch.year || ''));
 
-    const normalized = normalizeSemesterString(value);
+      const studyYearMatches =
+        !requestedStudyYear ||
+        !batchStudyYear ||
+        batchStudyYear === requestedStudyYear;
 
-    const clean = normalized
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, '')
-      .replace(/^SEMESTER/, '')
-      .replace(/^SEM/, '');
+      const semesterMatches =
+        !requestedSemester ||
+        normalizeSemester(String(batch.semester || '')) === requestedSemester;
 
-    const romanToNumber: Record<string, string> = {
-      I: '1',
-      II: '2',
-      III: '3',
-      IV: '4',
-      V: '5',
-      VI: '6',
-      VII: '7',
-      VIII: '8'
-    };
+      const batchBranchName =
+        branchValues.find(
+          (value) => normalizeBranch(value) === requestedBranch
+        ) || '';
 
-    return romanToNumber[clean] || clean;
-  };
-
-  const normalizeSection = (
-    value: string,
-    branchName: string
-  ): string => {
-    const clean = value.trim().toUpperCase()
-      .replace(/^(SECTION|SEC)\s*/, '');
-
-    const separatorIndex = clean.lastIndexOf('-');
-
-    if (separatorIndex > 0) {
-      const prefix = clean.slice(0, separatorIndex);
-
-      if (normalizeBranch(prefix) === normalizeBranch(branchName)) {
-        return clean
-          .slice(separatorIndex + 1)
-          .replace(/[^A-Z0-9]/g, '');
-      }
-    }
-
-    return normalizeSectionString(clean)
-      .replace(/[^A-Z0-9]/g, '')
-      .replace(/^(SECTION|SEC)/, '');
-  };
-
-  const normalizeProgramme = (value: string): string => {
-    const clean = normalizeProgrammeString(value).toUpperCase();
-
-    if (
-      clean === 'BACHELOROFTECHNOLOGY' ||
-      clean === 'BACHELORTECHNOLOGY' ||
-      clean === 'BTECH'
-    ) {
-      return 'BTECH';
-    }
-
-    return clean;
-  };
-
-  const requestedYear = normalizeYear(year);
-  const requestedStudyYear = normalizeStudyYear(studyYear);
-  const requestedBranch = normalizeBranch(branch);
-  const requestedSemester = normalizeSemester(semester);
-  const requestedSection = normalizeSection(section, branch);
-  const requestedProgramme = normalizeProgramme(programme);
-
-  const matchingClassBatches = all.filter((batch) => {
-    if (String(batch.status || '').toLowerCase() !== 'active') {
-      return false;
-    }
-
-    const branchValues = [
-      batch.branch || '',
-      batch.department || '',
-      String((batch as any).branchCode || ''),
-      String(batch.batchCode || (batch as any).batch_code || '').split('-')[0]
-    ].filter(Boolean);
-
-    const branchMatches = branchValues.some(
-      (value) => normalizeBranch(value) === requestedBranch
-    );
-
-    const yearMatches =
-      !requestedYear ||
-      normalizeYear(String(batch.academicYear || '')) === requestedYear;
-
-    const batchStudyYear = normalizeStudyYear(String(batch.year || ''));
-
-    // Older batches may not contain a recognizable study-year value.
-    // Keep those eligible, but compare study years when both are available.
-    const studyYearMatches =
-      !requestedStudyYear ||
-      !batchStudyYear ||
-      batchStudyYear === requestedStudyYear;
-
-    const semesterMatches =
-      !requestedSemester ||
-      normalizeSemester(String(batch.semester || '')) === requestedSemester;
-
-    const batchBranchName =
-      branchValues.find(
-        (value) => normalizeBranch(value) === requestedBranch
-      ) || '';
-
-    const sectionMatches =
-      !requestedSection ||
-      normalizeSection(String(batch.section || ''), batchBranchName) === requestedSection;
-
-    return (
-      branchMatches &&
-      studyYearMatches &&
-      yearMatches &&
-      semesterMatches &&
-      sectionMatches
-    );
-  });
-
-  const describeRequest = () =>
-    `${branch} (${semester || 'any semester'}, Section ${section || 'any'}, ${year || 'any academic year'}${programme ? `, ${programme}` : ''})`;
-
-  if (matchingClassBatches.length === 0) {
-    throw new Error(
-      `No active academic batch matches ${describeRequest()}.`
-    );
-  }
-
-  if (requestedProgramme) {
-    const programmeMatches = matchingClassBatches.filter((batch) => {
-      const batchProgramme = String(batch.programme || '').trim();
+      const sectionMatches =
+        !requestedSection ||
+        normalizeSection(String(batch.section || ''), batchBranchName) === requestedSection;
 
       return (
-        batchProgramme &&
-        normalizeProgramme(batchProgramme) === requestedProgramme
+        branchMatches &&
+        studyYearMatches &&
+        yearMatches &&
+        semesterMatches &&
+        sectionMatches
       );
     });
 
-    if (programmeMatches.length === 1) {
-      return programmeMatches[0];
+    const describeRequest = () =>
+      `${branch} (${semester || 'any semester'}, Section ${section || 'any'}, ${year || 'any academic year'}${programme ? `, ${programme}` : ''})`;
+
+    if (matchingClassBatches.length === 0) {
+      throw new Error(
+        `No active academic batch matches ${describeRequest()}.`
+      );
     }
 
-    if (programmeMatches.length > 1) {
-      const programmeDisplay =
-        requestedProgramme === 'BTECH' ? 'B.Tech' : programme;
+    if (requestedProgramme) {
+      const programmeMatches = matchingClassBatches.filter((batch) => {
+        const batchProgramme = String(batch.programme || '').trim();
 
-      const expectedBatchName =
-        `${programmeDisplay} ${branch} → ${normalizeSemesterString(semester)} → Section ${section}`;
+        return (
+          batchProgramme &&
+          normalizeProgramme(batchProgramme) === requestedProgramme
+        );
+      });
 
-      const normalizeLabel = (value: string): string =>
-        value.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-      const canonicalNameMatches = programmeMatches.filter((batch) =>
-        [
-          batch.batchName,
-          batch.batchCode,
-          (batch as any).name
-        ].some(
-          (name) =>
-            name &&
-            normalizeLabel(String(name)) === normalizeLabel(expectedBatchName)
-        )
-      );
-
-      const uuidMatches = canonicalNameMatches.filter((batch) =>
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-          batch.id
-        )
-      );
-
-      if (uuidMatches.length === 1) {
-        return uuidMatches[0];
+      if (programmeMatches.length === 1) {
+        return programmeMatches[0];
       }
 
-      if (canonicalNameMatches.length === 1) {
-        return canonicalNameMatches[0];
+      if (programmeMatches.length > 1) {
+        const programmeDisplay =
+          requestedProgramme === 'BTECH' ? 'B.Tech' : programme;
+
+        const expectedBatchName =
+          `${programmeDisplay} ${branch} → ${normalizeSemesterString(semester)} → Section ${section}`;
+
+        const normalizeLabel = (value: string): string =>
+          value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+        const canonicalNameMatches = programmeMatches.filter((batch) =>
+          [
+            batch.batchName,
+            batch.batchCode,
+            (batch as any).name
+          ].some(
+            (name) =>
+              name &&
+              normalizeLabel(String(name)) === normalizeLabel(expectedBatchName)
+          )
+        );
+
+        const uuidMatches = canonicalNameMatches.filter((batch) =>
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+            batch.id
+          )
+        );
+
+        if (uuidMatches.length === 1) {
+          return uuidMatches[0];
+        }
+
+        if (canonicalNameMatches.length === 1) {
+          return canonicalNameMatches[0];
+        }
+
+        throw new Error(
+          `Multiple active ${programme} batches match ${describeRequest()}. Ask an administrator to resolve the duplicate batch configuration.`
+        );
+      }
+
+      const unspecifiedProgrammeMatches = matchingClassBatches.filter(
+        (batch) => !String(batch.programme || '').trim()
+      );
+
+      if (
+        matchingClassBatches.length === 1 &&
+        unspecifiedProgrammeMatches.length === 1
+      ) {
+        return unspecifiedProgrammeMatches[0];
+      }
+
+      if (unspecifiedProgrammeMatches.length > 0) {
+        throw new Error(
+          `Multiple active academic batches match ${describeRequest()}, and the programme is unspecified on one or more batches. Ask an administrator to resolve the ambiguity.`
+        );
       }
 
       throw new Error(
-        `Multiple active ${programme} batches match ${describeRequest()}. Ask an administrator to resolve the duplicate batch configuration.`
+        `No active academic batch matches ${describeRequest()}.`
       );
     }
 
-    const unspecifiedProgrammeMatches = matchingClassBatches.filter(
-      (batch) => !String(batch.programme || '').trim()
-    );
-
-    if (
-      matchingClassBatches.length === 1 &&
-      unspecifiedProgrammeMatches.length === 1
-    ) {
-      return unspecifiedProgrammeMatches[0];
-    }
-
-    if (unspecifiedProgrammeMatches.length > 0) {
+    if (matchingClassBatches.length > 1) {
       throw new Error(
-        `Multiple active academic batches match ${describeRequest()}, and the programme is unspecified on one or more batches. Ask an administrator to resolve the ambiguity.`
+        `Multiple active academic batches match ${describeRequest()}. Ask an administrator to resolve the duplicate batch configuration.`
       );
     }
 
-    throw new Error(
-      `No active academic batch matches ${describeRequest()}.`
-    );
+    return matchingClassBatches[0];
   }
-
-  if (matchingClassBatches.length > 1) {
-    throw new Error(
-      `Multiple active academic batches match ${describeRequest()}. Ask an administrator to resolve the duplicate batch configuration.`
-    );
-  }
-
-  return matchingClassBatches[0];
-}
-
 
   async createBatch(batchData: Partial<AcademicBatch>, adminName: string = 'Administrator'): Promise<AcademicBatch> {
     const id = batchData.id || `BATCH-${Date.now()}`;
@@ -2331,11 +2373,32 @@ async findBatchForStudent(
     facultyId: string,
     assignedBy: string = 'Administrator'
   ): Promise<void> {
-    const clean = studentRollNo.trim().toUpperCase();
-    const student = await this.getProfileByRollNo(clean);
+    const cleanRoll = studentRollNo.trim().toUpperCase();
+    const cleanFacultyId = facultyId.trim().toUpperCase();
+    void assignedBy;
+
+    const { error } = await supabase
+      .from('students')
+      .update({
+        assigned_faculty_id: cleanFacultyId || null,
+        updated_at: new Date().toISOString()
+      })
+      .ilike('roll_no', cleanRoll)
+      .abortSignal(AbortSignal.timeout(APP_DATA_QUERY_TIMEOUT_MS));
+
+    if (error) {
+      throw new Error(`Failed to assign faculty ${cleanFacultyId} to student ${cleanRoll}: ${error.message}`);
+    }
+
+    const student = await this.getProfileByRollNo(cleanRoll);
     if (student) {
-      student.assignedFacultyId = facultyId;
-      await this.saveProfile(student);
+      student.assignedFacultyId = cleanFacultyId;
+      await saveSupabaseAppData('studentProfiles', cleanRoll, {
+        ...student,
+        id: cleanRoll,
+        rollNo: cleanRoll,
+        assignedFacultyId: cleanFacultyId
+      });
     }
   }
 

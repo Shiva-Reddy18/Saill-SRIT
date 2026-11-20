@@ -3,7 +3,7 @@ import { StudentProfile, PortfolioItem, UserRole } from '../../types';
 import { FacultyAssignment } from '../../types/academic';
 import { FacultyWorkbenchTabKey } from '../../types/faculty';
 import { dbStorage } from '../../lib/db';
-import { AuthService } from '../../services/AuthService';
+import { useAuth } from '../../context/AuthContext';
 import { FacultyAssignmentService } from '../../services/FacultyAssignmentService';
 import { FacultyPermissionGuard } from '../../services/FacultyPermissionGuard';
 
@@ -33,7 +33,6 @@ import {
   FileSpreadsheet,
   Settings
 } from 'lucide-react';
-// import { error } from 'console';
 
 interface FacultyWorkbenchProps {
   portfolioItems: PortfolioItem[];
@@ -46,9 +45,9 @@ export const FacultyWorkbench: React.FC<FacultyWorkbenchProps> = ({
   onOpenModule,
   activeRole = 'FACULTY_INCHARGE'
 }) => {
-  const currentUser = AuthService.getCurrentUser();
-  const currentEmpId = currentUser?.employeeId || currentUser?.username || 'EMP-ENG-101';
-  const facultyName = currentUser?.name || 'Dr. V. Lakshmi';
+  const { user: currentUser } = useAuth();
+  const currentEmpId = currentUser?.employeeId || currentUser?.username || '';
+  const facultyName = currentUser?.name || 'Faculty Incharge';
   const department = currentUser?.department || 'Humanities & Sciences (English)';
 
   const [activeTab, setActiveTab] = useState<FacultyWorkbenchTabKey>('home');
@@ -62,32 +61,43 @@ export const FacultyWorkbench: React.FC<FacultyWorkbenchProps> = ({
 
   useEffect(() => {
     loadFacultyScopeData();
-  }, [currentEmpId, activeRole]);
+  }, [currentEmpId, activeRole, currentUser?.role]);
 
   const loadFacultyScopeData = async () => {
     try {
-      // Check status from registered users / faculty account table
-      const registeredUser = await dbStorage.getUserRegistration(currentEmpId);
-      const facultyAccount = await dbStorage.getFacultyByEmployeeId(currentEmpId);
+      const isAdministrator =
+        activeRole.toString().toUpperCase() === 'ADMINISTRATOR' ||
+        currentUser?.role?.toUpperCase() === 'ADMINISTRATOR';
 
-      if (registeredUser) {
-        if (registeredUser.status === 'PENDING_APPROVAL') {
-          setAccountStatus('PENDING_APPROVAL');
-        } else if (registeredUser.status === 'REJECTED') {
-          setAccountStatus('REJECTED');
+      if (!isAdministrator && !currentEmpId) {
+        setActiveAssignments([]);
+        setAssignedStudents([]);
+        return;
+      }
+
+      if (currentEmpId) {
+        const registeredUser = await dbStorage.getUserRegistration(currentEmpId);
+        const facultyAccount = await dbStorage.getFacultyByEmployeeId(currentEmpId);
+
+        if (registeredUser) {
+          if (registeredUser.status === 'PENDING_APPROVAL') {
+            setAccountStatus('PENDING_APPROVAL');
+          } else if (registeredUser.status === 'REJECTED') {
+            setAccountStatus('REJECTED');
+          } else {
+            setAccountStatus('APPROVED');
+          }
+        } else if (facultyAccount) {
+          if (facultyAccount.status === 'pending') {
+            setAccountStatus('PENDING_APPROVAL');
+          } else if (facultyAccount.status === 'rejected') {
+            setAccountStatus('REJECTED');
+          } else {
+            setAccountStatus('APPROVED');
+          }
         } else {
           setAccountStatus('APPROVED');
         }
-      } else if (facultyAccount) {
-        if (facultyAccount.status === 'pending') {
-          setAccountStatus('PENDING_APPROVAL');
-        } else if (facultyAccount.status === 'rejected') {
-          setAccountStatus('REJECTED');
-        } else {
-          setAccountStatus('APPROVED');
-        }
-      } else {
-        setAccountStatus('APPROVED');
       }
 
       const fetchedStudents = await dbStorage.getAllProfiles();
@@ -95,12 +105,8 @@ export const FacultyWorkbench: React.FC<FacultyWorkbenchProps> = ({
 
       const allBatches = await dbStorage.getAllBatches();
 
-      // Load persisted faculty assignments before using the synchronous cache getters.
-      await FacultyAssignmentService.initFromDB();
-
-      const isAdministrator =
-        activeRole.toString().toUpperCase() === 'ADMINISTRATOR' ||
-        currentUser?.role?.toUpperCase() === 'ADMINISTRATOR';
+      // Always fetch fresh faculty assignments from Supabase.
+      await FacultyAssignmentService.initFromDB(true);
 
       if (isAdministrator) {
         const allAssigns = FacultyAssignmentService.getAllAssignments();
@@ -124,9 +130,8 @@ export const FacultyWorkbench: React.FC<FacultyWorkbenchProps> = ({
         );
         setAssignedStudents(mapped);
       }
-    } catch {
-      
-  console.error('[FacultyWorkbench] Failed to load faculty scope:');
+    } catch (error) {
+      console.error('[FacultyWorkbench] Failed to load faculty scope:', error);
     }
   };
 
@@ -175,7 +180,7 @@ export const FacultyWorkbench: React.FC<FacultyWorkbenchProps> = ({
               </span>
             </div>
             <p className="text-xs text-gray-300 mt-0.5">
-              Emp ID: <span className="font-mono text-white font-semibold">{currentEmpId}</span> • Dept:{' '}
+              Emp ID: <span className="font-mono text-white font-semibold">{currentEmpId || 'Unassigned'}</span> • Dept:{' '}
               <span className="text-white font-medium">{department}</span>
             </p>
           </div>
